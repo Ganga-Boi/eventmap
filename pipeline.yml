@@ -1,0 +1,129 @@
+# EventMap — Automatisk pipeline
+# =================================
+# Kører scraping hver 6. time, committér events_api.json til repo,
+# og trigger Vercel redeploy.
+#
+# Secrets (sæt i GitHub repo → Settings → Secrets → Actions):
+#   EVENTMAP_SHEET_ID          — Google Sheet ID
+#   EVENTMAP_CREDENTIALS_JSON  — Service account JSON som string
+#   VERCEL_DEPLOY_HOOK         — Valgfri: Vercel deploy hook URL (trigger redeploy)
+#
+# Hvad der sker ved fejl:
+#   - Scriptet fejler → workflow fejler → GitHub sender mail til dig
+#   - events_api.json forbliver uændret (gammel data er bedre end ingen data)
+#   - Fejl vises i workflow-log med præcis årsag
+
+name: EventMap Pipeline
+
+on:
+  schedule:
+    # Kør kl. 06, 12, 18, 00 UTC (08, 14, 20, 02 dansk tid)
+    - cron: '0 6,12,18,0 * * *'
+
+  # Tillad manuel kørsel fra GitHub Actions-UI
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run — kør pipeline men commit ikke'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['true', 'false']
+
+jobs:
+  scrape-and-update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15  # Dræb jobbet hvis det hænger
+
+    steps:
+      # ── Checkout ────────────────────────────────────────────────────────
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # ── Python ──────────────────────────────────────────────────────────
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Installer dependencies
+        run: |
+          pip install playwright gspread google-auth icalendar requests
+          playwright install chromium --with-deps
+
+      # ── Credentials ─────────────────────────────────────────────────────
+      - name: Skriv credentials til fil
+        run: |
+          echo '${{ secrets.EVENTMAP_CREDENTIALS_JSON }}' > pipeline/credentials.json
+          echo "EVENTMAP_SHEET_ID=${{ secrets.EVENTMAP_SHEET_ID }}" >> $GITHUB_ENV
+
+      # ── Kør pipeline ─────────────────────────────────────────────────────
+      - name: Kør EventMap pipeline
+        id: pipeline
+        run: |
+          cd pipeline
+          python pipeline.py 2>&1 | tee ../pipeline_output.log
+          echo "exit_code=${PIPESTATUS[0]}" >> $GITHUB_OUTPUT
+        env:
+          EVENTMAP_SHEET_ID: ${{ secrets.EVENTMAP_SHEET_ID }}
+
+      # ── Valider output ───────────────────────────────────────────────────
+      - name: Valider events_api.json
+        run: |
+          python - <<'EOF'
+          import json, sys
+          try:
+              with open('public/events_api.json') as f:
+                  data = json.load(f)
+              count = data.get('total', 0)
+              print(f"✓ JSON valid — {count} events")
+              if count == 0:
+                  print("⚠ Advarsel: 0 events i output")
+                  # Fejl ikke — 0 events kan være legitimt
+          except Exception as e:
+              print(f"✗ JSON ugyldig: {e}")
+              sys.exit(1)
+          EOF
+
+      # ── Commit (kun hvis ikke dry run) ───────────────────────────────────
+      - name: Commit events_api.json
+        if: inputs.dry_run != 'true'
+        run: |
+          git config user.name  "eventmap-bot"
+          git config user.email "bot@eventmap"
+
+          git add public/events_api.json
+
+          if git diff --staged --quiet; then
+            echo "Ingen ændringer — springer commit over"
+          else
+            TIMESTAMP=$(date -u '+%Y-%m-%d %H:%M UTC')
+            EVENT_COUNT=$(python -c "import json; d=json.load(open('public/events_api.json')); print(d['total'])")
+            git commit -m "events: ${EVENT_COUNT} events (${TIMESTAMP})"
+            git push
+            echo "✓ Committed og pushed"
+          fi
+
+      # ── Trigger Vercel redeploy ──────────────────────────────────────────
+      - name: Trigger Vercel deploy
+        if: inputs.dry_run != 'true' && secrets.VERCEL_DEPLOY_HOOK != ''
+        run: |
+          curl -s -X POST "${{ secrets.VERCEL_DEPLOY_HOOK }}" \
+            -o /dev/null -w "HTTP %{http_code}\n"
+
+      # ── Upload log ved fejl ──────────────────────────────────────────────
+      - name: Upload pipeline log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-log-${{ github.run_id }}
+          path: pipeline_output.log
+          retention-days: 7
+
+      # ── Ryd op ───────────────────────────────────────────────────────────
+      - name: Ryd credentials
+        if: always()
+        run: rm -f pipeline/credentials.json
