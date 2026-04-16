@@ -1,0 +1,31 @@
+# Credentials — må aldrig i git
+pipeline/credentials.json
+pipeline/service_account.json
+
+# Debug-output fra scrapers
+pipeline/ida_source.html
+pipeline/ida_cludo_response.json
+pipeline/ida_cludo_debug.json
+pipeline/ida_debug.html
+pipeline/*.log
+
+# Pipeline output (genereres automatisk)
+pipeline/events_api.json
+pipeline/ida_events.json
+pipeline/bibliotek_events.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Node
+node_modules/
+.env
+.env.local
+
+# OS
+.DS_Store
+Thumbs.db
